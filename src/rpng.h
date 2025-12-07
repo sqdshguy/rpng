@@ -1278,7 +1278,7 @@ char *rpng_load_image_from_memory(const char *buffer, int *width, int *height, i
                 int pixel_size = *color_channels*(*bit_depth/8);
                 data = rpng_inflate_image_data(chunk_image.data, chunk_image.length, *width, *height, pixel_size);
 
-                if (data == NULL) RPNG_LOG("WARNING: IDAT image data ¡decompression failed\n");
+                if (data == NULL) RPNG_LOG("WARNING: IDAT image data ï¿½decompression failed\n");
             }
             else RPNG_LOG("WARNING: CRC not valid, IDAT chunk image data could be corrupted\n");
         }
@@ -1360,7 +1360,7 @@ char *rpng_load_image_indexed_from_memory(const char *buffer, int *width, int *h
                     int pixel_size = (IHDRData->bit_depth/8); // NOTE: Assume 1 channel
                     data = rpng_inflate_image_data(chunk_image.data, chunk_image.length, *width, *height, pixel_size);
 
-                    if (data == NULL) RPNG_LOG("WARNING: IDAT image data ¡decompression failed\n");
+                    if (data == NULL) RPNG_LOG("WARNING: IDAT image data ï¿½decompression failed\n");
                 }
                 else RPNG_LOG("WARNING: CRC not valid, IDAT chunk image data could be corrupted\n");
             }
@@ -2145,59 +2145,97 @@ static char *rpng_deflate_image_data(const char *image_data, int image_data_size
 static char *rpng_inflate_image_data(char *image_data, int image_data_size, int width, int height, int pixel_size)
 {
     char *image_data_unfiltered = NULL;
-    char *image_data_filtered = (char *)RPNG_CALLOC(RPNG_MAX_OUTPUT_SIZE, 1); // WARNING: Allocate enough memory to load full image decompressed
+    char *image_data_filtered = NULL;
+    size_t expected_unfiltered_size = 0;
+    int success = 0;
 
-    // Decompress IDAT chunk data
-    int image_data_decomp_size = zsinflate(image_data_filtered, RPNG_MAX_OUTPUT_SIZE, image_data, image_data_size);
+    if ((width <= 0) || (height <= 0) || (pixel_size <= 0)) return NULL;
+
+    // Validate scanline math to avoid integer overflows.
+    size_t scanline_size_check = (size_t)width*(size_t)pixel_size;
+    if (((size_t)width != 0) && (scanline_size_check/(size_t)width != (size_t)pixel_size)) return NULL;
+
+    size_t filtered_scanline_size = scanline_size_check + 1; // +1 byte per scanline for filter type
+    if (filtered_scanline_size <= scanline_size_check) return NULL;
+
+    size_t expected_filtered_size = filtered_scanline_size*(size_t)height;
+    if (((size_t)height != 0) && (expected_filtered_size/(size_t)height != filtered_scanline_size)) return NULL;
+
+    // Enforce decompression cap derived from IHDR, not just the hard limit.
+    if (expected_filtered_size > (size_t)RPNG_MAX_OUTPUT_SIZE)
+    {
+      RPNG_LOG("ERROR: IDAT data exceeds max output size: %zu > %i\n", expected_filtered_size, RPNG_MAX_OUTPUT_SIZE);
+      return NULL;
+    }
+
+    expected_unfiltered_size = (size_t)scanline_size_check*(size_t)height;
+    if (((size_t)height != 0) && (expected_unfiltered_size/(size_t)height != scanline_size_check)) return NULL;
+
+    int scanline_size = (int)scanline_size_check;
+    int filtered_buffer_size = (int)expected_filtered_size;
+
+    image_data_filtered = (char *)RPNG_CALLOC(filtered_buffer_size, 1);
+    if (image_data_filtered == NULL) return NULL;
+
+    // Decompress IDAT chunk data into bounded buffer
+    int image_data_decomp_size = zsinflate(image_data_filtered, filtered_buffer_size, image_data, image_data_size);
 
     RPNG_LOG("INFO: IDAT data decompressed: %i -> %i\n", image_data_size, image_data_decomp_size);
 
-    if ((image_data_filtered != NULL) && (image_data_decomp_size > 0))
+    if ((image_data_decomp_size <= 0) || ((size_t)image_data_decomp_size < expected_filtered_size))
     {
-        // Now we have the data decompressed but every scanline of the image was originally filtered for
-        // maximum compression and one extra byte with the filter type was added to every scanline
-        // We must undo that image prefiltering for every scanline
+      RPNG_LOG("ERROR: IDAT data decompression failed or truncated: %i (expected at least %zu)\n", image_data_decomp_size, expected_filtered_size);
+      goto cleanup;
+    }
 
-        // Image data reverse pre-processing for filter type
-        //int pixel_size = *color_channels*(*bit_depth/8);
-        int scanline_size = width*pixel_size;
-        image_data_unfiltered = (char *)RPNG_CALLOC(image_data_decomp_size, 1);  // Actually data unfiltered size should be smaller
+    image_data_unfiltered = (char *)RPNG_CALLOC(expected_unfiltered_size, 1);
+    if (image_data_unfiltered == NULL) goto cleanup;
 
-        int current_filter = 0;
-        int out = 0, x = 0, a = 0, b = 0, c = 0;
+    // Now we have the data decompressed but every scanline of the image was originally filtered for
+    // maximum compression and one extra byte with the filter type was added to every scanline
+    // We must undo that image prefiltering for every scanline
+    int current_filter = 0;
+    int out = 0, x = 0, a = 0, b = 0, c = 0;
 
-        // Reverse scanlines filters
-        for (int y = 0; y < height; y++)   // Move scanline by scanline, we must discard first byte = current_filter
+    // Reverse scanlines filters
+    for (int y = 0; y < height; y++)   // Move scanline by scanline, we must discard first byte = current_filter
+    {
+      current_filter = (int)image_data_filtered[(1 + scanline_size)*y];
+
+      for (int p = 0; p < scanline_size; p++)
+      {
+        // x = current byte
+        // a = left pixel byte (from current)
+        // b = above pixel byte (from current)
+        // c = left pixel byte (from b)
+        x = (int)(image_data_filtered[(1 + scanline_size)*y + 1 + p]);
+        a = (p >= pixel_size) ? (int)(image_data_unfiltered[scanline_size*y + p - pixel_size]) : 0;
+        b = (y > 0) ? (int)(image_data_unfiltered[scanline_size*(y - 1) + p]) : 0;
+        c = (y > 0) ? ((p >= pixel_size) ? (int)(image_data_unfiltered[scanline_size*(y - 1) + p - pixel_size]) : 0) : 0;
+
+        switch (current_filter)
         {
-            current_filter = (int)image_data_filtered[(1 + scanline_size)*y];
-
-            for (int p = 0; p < scanline_size; p++)
-            {
-                // x = current byte
-                // a = left pixel byte (from current)
-                // b = above pixel byte (from current)
-                // c = left pixel byte (from b)
-                x = (int)(image_data_filtered[(1 + scanline_size)*y + 1 + p]);
-                a = (p >= pixel_size) ? (int)(image_data_unfiltered[scanline_size*y + p - pixel_size]) : 0;
-                b = (y > 0) ? (int)(image_data_unfiltered[scanline_size*(y - 1) + p]) : 0;
-                c = (y > 0) ? ((p >= pixel_size) ? (int)(image_data_unfiltered[scanline_size*(y - 1) + p - pixel_size]) : 0) : 0;
-
-                switch (current_filter)
-                {
-                    case 0: out = x; break;         // Filter type 0: None (Usually used for indexed images)
-                    case 1: out = x + a; break;     // Filter type 1: Sub
-                    case 2: out = x + b; break;     // Filter type 2: Up
-                    case 3: out = x + ((a + b)>>1); break;    // Filter type 3: Average
-                    case 4: out = x + rpng_paeth_predictor(a, b, c); break;  // Filter type 4: Paeth
-                    default: break;
-                }
-
-                // Register scanline unfiltered values, byte by byte
-                image_data_unfiltered[y*scanline_size + p] = (char)out;
-            }
+          case 0: out = x; break;         // Filter type 0: None (Usually used for indexed images)
+          case 1: out = x + a; break;     // Filter type 1: Sub
+          case 2: out = x + b; break;     // Filter type 2: Up
+          case 3: out = x + ((a + b)>>1); break;    // Filter type 3: Average
+          case 4: out = x + rpng_paeth_predictor(a, b, c); break;  // Filter type 4: Paeth
+          default: break;
         }
 
-        RPNG_FREE(image_data_filtered);
+        // Register scanline unfiltered values, byte by byte
+        image_data_unfiltered[y*scanline_size + p] = (char)out;
+      }
+    }
+
+    success = 1;
+
+  cleanup:
+    RPNG_FREE(image_data_filtered);
+    if (!success && (image_data_unfiltered != NULL))
+    {
+      RPNG_FREE(image_data_unfiltered);
+      image_data_unfiltered = NULL;
     }
 
     return image_data_unfiltered;
