@@ -204,6 +204,7 @@
 //----------------------------------------------------------------------------------
 #ifndef __cplusplus
 #include <stdbool.h>        // Boolean type
+#include <limits.h>         // INT_MAX
 #endif
 
 // PNG chunk type
@@ -478,6 +479,7 @@ const unsigned char png_signature[8] = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1
 //----------------------------------------------------------------------------------
 // Module Internal Functions Declaration
 //----------------------------------------------------------------------------------
+static bool rpng_validate_image_layout(int width, int height, int pixel_size, size_t *scanline_size, size_t *filtered_size, size_t *unfiltered_size, bool enforce_max_output);
 // Prefilter and compress image data (image_data -> IDAT chunk.data)
 static char *rpng_inflate_image_data(char *image_data, int image_data_size, int width, int height, int pixel_size);
 // Decompress and unfilter image data (IDAT chunk.data -> image_data)
@@ -1253,6 +1255,15 @@ char *rpng_load_image_from_memory(const char *buffer, int *width, int *height, i
     // TODO: Support bit depths of 1/2/4 bits? -> Convert to 8bit grayscale
     if ((*color_channels == 1) && (*bit_depth != 8) && (*bit_depth != 16)) return data;  // Bit depth 1/2/4 not supported
 
+    size_t scanline_size = 0, filtered_size = 0, unfiltered_size = 0;
+    int pixel_size = *color_channels*(*bit_depth/8);
+    if (!rpng_validate_image_layout(*width, *height, pixel_size, &scanline_size, &filtered_size, &unfiltered_size, true))
+    {
+      RPNG_LOG("WARNING: Invalid image dimensions or size overflow (IHDR)");
+      RPNG_FREE(chunk_info.data);
+      return NULL;
+    }
+
     // Additional info provided by IHDR (in case it was required)
     //IHDRData->compression;        // Compression method: 0 (DEFLATE)
     //IHDRData->filter;             // Filter method: 0 (default)
@@ -1275,7 +1286,6 @@ char *rpng_load_image_from_memory(const char *buffer, int *width, int *height, i
 
             if (crc == chunk_image.crc) // Validate crc
             {
-                int pixel_size = *color_channels*(*bit_depth/8);
                 data = rpng_inflate_image_data(chunk_image.data, chunk_image.length, *width, *height, pixel_size);
 
                 if (data == NULL) RPNG_LOG("WARNING: IDAT image data �decompression failed\n");
@@ -1342,6 +1352,14 @@ char *rpng_load_image_indexed_from_memory(const char *buffer, int *width, int *h
         // Verify color type is indexed (3) and bit depth is 8
         if ((IHDRData->color_type == 3) && (IHDRData->bit_depth == 8))
         {
+            size_t scanline_size = 0, filtered_size = 0, unfiltered_size = 0;
+            int pixel_size = (IHDRData->bit_depth/8); // NOTE: Assume 1 channel
+            if (!rpng_validate_image_layout(*width, *height, pixel_size, &scanline_size, &filtered_size, &unfiltered_size, true))
+            {
+                RPNG_FREE(chunk_info.data);
+                return NULL;
+            }
+
             // NOTE: All splitted chunks are joined on reading
             rpng_chunk chunk_image = rpng_chunk_read_from_memory(buffer, "IDAT");
 
@@ -1357,7 +1375,6 @@ char *rpng_load_image_indexed_from_memory(const char *buffer, int *width, int *h
 
                 if (crc == chunk_image.crc) // Validate crc
                 {
-                    int pixel_size = (IHDRData->bit_depth/8); // NOTE: Assume 1 channel
                     data = rpng_inflate_image_data(chunk_image.data, chunk_image.length, *width, *height, pixel_size);
 
                     if (data == NULL) RPNG_LOG("WARNING: IDAT image data �decompression failed\n");
@@ -1402,8 +1419,12 @@ char *rpng_save_image_to_memory(const char *data, int width, int height, int col
 
     // Image data pre-processing to append filter type byte to every scanline
     int pixel_size = color_channels*(bit_depth/8);
+    size_t scanline_size = 0, filtered_size = 0, unfiltered_size = 0;
+    if (!rpng_validate_image_layout(width, height, pixel_size, &scanline_size, &filtered_size, &unfiltered_size, true)) return output_buffer;
+    if (unfiltered_size > (size_t)INT_MAX) return output_buffer;
+
     int comp_data_size = 0;
-    char *comp_data = rpng_deflate_image_data(data, width*height*pixel_size, width, height, pixel_size, &comp_data_size, -1);
+    char *comp_data = rpng_deflate_image_data(data, (int)unfiltered_size, width, height, pixel_size, &comp_data_size, -1);
 
     // Security check to verify compression worked
     if ((comp_data != NULL) && (comp_data_size > 0))
@@ -1461,8 +1482,12 @@ char *rpng_save_image_indexed_to_memory(const char *indexed_data, int width, int
 
     // Image data pre-processing to append filter type byte to every scanline
     int pixel_size = 1; // 1 byte per pixel (indexed data)
+    size_t scanline_size = 0, filtered_size = 0, unfiltered_size = 0;
+    if (!rpng_validate_image_layout(width, height, pixel_size, &scanline_size, &filtered_size, &unfiltered_size, true)) return output_buffer;
+    if (unfiltered_size > (size_t)INT_MAX) return output_buffer;
+
     int comp_data_size = 0;
-    char *comp_data = rpng_deflate_image_data(indexed_data, width*height*pixel_size, width, height, pixel_size, &comp_data_size, 0);
+    char *comp_data = rpng_deflate_image_data(indexed_data, (int)unfiltered_size, width, height, pixel_size, &comp_data_size, 0);
 
     // Security check to verify compression worked
     if ((comp_data != NULL) && (comp_data_size > 0))
@@ -1560,16 +1585,22 @@ char *rpng_unindex_image_data(char *indexed_data, int width, int height, rpng_pa
 
     if ((indexed_data != NULL) && (palette.color_count > 0) && (palette.colors != NULL))
     {
-        data = (char *)RPNG_CALLOC(width*height*4, sizeof(char));
+      size_t scanline_size = 0, filtered_size = 0, unfiltered_size = 0;
+      if (!rpng_validate_image_layout(width, height, 1, &scanline_size, &filtered_size, &unfiltered_size, true)) return NULL;
 
-        for (int i = 0; i < width*height; i++)
-        {
-            data[i*4 + 0] = palette.colors[(int)indexed_data[i]].r;
-            data[i*4 + 1] = palette.colors[(int)indexed_data[i]].g;
-            data[i*4 + 2] = palette.colors[(int)indexed_data[i]].b;
-            data[i*4 + 3] = palette.colors[(int)indexed_data[i]].a;
-        }
+      size_t output_size = unfiltered_size*4; // RGBA output
+      if ((unfiltered_size != 0) && (output_size/unfiltered_size != 4)) return NULL;
+      if (output_size > (size_t)RPNG_MAX_OUTPUT_SIZE) return NULL;
 
+      data = (char *)RPNG_CALLOC(output_size, sizeof(char));
+
+      for (size_t i = 0; i < unfiltered_size; i++)
+      {
+        data[i*4 + 0] = palette.colors[(int)indexed_data[i]].r;
+        data[i*4 + 1] = palette.colors[(int)indexed_data[i]].g;
+        data[i*4 + 2] = palette.colors[(int)indexed_data[i]].b;
+        data[i*4 + 3] = palette.colors[(int)indexed_data[i]].a;
+      }
     }
     else RPNG_LOG("Provided indexed data or palette not valid, data can not be un-indexed\n");
 
@@ -2031,14 +2062,44 @@ char *rpng_chunk_split_image_data_from_memory(char *buffer, int split_size, int 
 //----------------------------------------------------------------------------------
 
 // Prefilter and compress image data
+static bool rpng_validate_image_layout(int width, int height, int pixel_size, size_t *scanline_size, size_t *filtered_size, size_t *unfiltered_size, bool enforce_max_output)
+{
+    if ((width <= 0) || (height <= 0) || (pixel_size <= 0)) return false;
+
+    size_t scanline = (size_t)width*(size_t)pixel_size;
+    if (((size_t)width != 0) && (scanline/(size_t)width != (size_t)pixel_size)) return false;
+
+    size_t filtered_scanline = scanline + 1; // +1 byte per scanline for filter type
+    if (filtered_scanline <= scanline) return false;
+
+    size_t filtered_total = filtered_scanline*(size_t)height;
+    if (((size_t)height != 0) && (filtered_total/(size_t)height != filtered_scanline)) return false;
+
+    size_t unfiltered_total = scanline*(size_t)height;
+    if (((size_t)height != 0) && (unfiltered_total/(size_t)height != scanline)) return false;
+
+    if (enforce_max_output && ((filtered_total > (size_t)RPNG_MAX_OUTPUT_SIZE) || (unfiltered_total > (size_t)RPNG_MAX_OUTPUT_SIZE))) return false;
+
+    if (scanline_size != NULL) *scanline_size = scanline;
+    if (filtered_size != NULL) *filtered_size = filtered_total;
+    if (unfiltered_size != NULL) *unfiltered_size = unfiltered_total;
+
+    return true;
+}
+
 static char *rpng_deflate_image_data(const char *image_data, int image_data_size, int width, int height, int pixel_size, int *output_size, int forced_filter_type)
 {
     char *idat_data = NULL;
 
     // Image data pre-processing to append filter type byte to every scanline
     //int pixel_size = color_channels*(bit_depth/8);
-    int scanline_size = width*pixel_size;
-    unsigned int data_filtered_size = (scanline_size + 1)*height;   // Adding 1 byte per scanline filter
+    size_t scanline_size_sz = 0;
+    size_t data_filtered_size_sz = 0;
+    if (!rpng_validate_image_layout(width, height, pixel_size, &scanline_size_sz, &data_filtered_size_sz, NULL, true)) return NULL;
+    if (data_filtered_size_sz > (size_t)INT_MAX) return NULL;
+
+    int scanline_size = (int)scanline_size_sz;
+    unsigned int data_filtered_size = (unsigned int)data_filtered_size_sz;   // Adding 1 byte per scanline filter
     unsigned char *data_filtered = (unsigned char *)RPNG_CALLOC(data_filtered_size, 1);
 
     int out = 0, x = 0, a = 0, b = 0, c = 0;
@@ -2147,29 +2208,12 @@ static char *rpng_inflate_image_data(char *image_data, int image_data_size, int 
     char *image_data_unfiltered = NULL;
     char *image_data_filtered = NULL;
     size_t expected_unfiltered_size = 0;
+    size_t expected_filtered_size = 0;
+    size_t scanline_size_check = 0;
     int success = 0;
 
-    if ((width <= 0) || (height <= 0) || (pixel_size <= 0)) return NULL;
-
-    // Validate scanline math to avoid integer overflows.
-    size_t scanline_size_check = (size_t)width*(size_t)pixel_size;
-    if (((size_t)width != 0) && (scanline_size_check/(size_t)width != (size_t)pixel_size)) return NULL;
-
-    size_t filtered_scanline_size = scanline_size_check + 1; // +1 byte per scanline for filter type
-    if (filtered_scanline_size <= scanline_size_check) return NULL;
-
-    size_t expected_filtered_size = filtered_scanline_size*(size_t)height;
-    if (((size_t)height != 0) && (expected_filtered_size/(size_t)height != filtered_scanline_size)) return NULL;
-
-    // Enforce decompression cap derived from IHDR, not just the hard limit.
-    if (expected_filtered_size > (size_t)RPNG_MAX_OUTPUT_SIZE)
-    {
-      RPNG_LOG("ERROR: IDAT data exceeds max output size: %zu > %i\n", expected_filtered_size, RPNG_MAX_OUTPUT_SIZE);
-      return NULL;
-    }
-
-    expected_unfiltered_size = (size_t)scanline_size_check*(size_t)height;
-    if (((size_t)height != 0) && (expected_unfiltered_size/(size_t)height != scanline_size_check)) return NULL;
+    if (!rpng_validate_image_layout(width, height, pixel_size, &scanline_size_check, &expected_filtered_size, &expected_unfiltered_size, true)) return NULL;
+    if ((scanline_size_check > (size_t)INT_MAX) || (expected_filtered_size > (size_t)INT_MAX)) return NULL;
 
     int scanline_size = (int)scanline_size_check;
     int filtered_buffer_size = (int)expected_filtered_size;
